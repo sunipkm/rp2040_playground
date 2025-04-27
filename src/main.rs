@@ -11,6 +11,7 @@ use defmt::*;
 use embassy_executor::{Executor, Spawner};
 use embassy_futures::{join::join, select::select};
 use embassy_rp::{
+    adc::{self, Adc, Async},
     bind_interrupts, gpio,
     multicore::{Stack, spawn_core1},
     peripherals::USB,
@@ -32,6 +33,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
+    ADC_IRQ_FIFO => adc::InterruptHandler;
 });
 
 #[embassy_executor::task]
@@ -50,6 +52,13 @@ async fn logger_task(driver: Driver<'static, USB>) {
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    // Set up the ADC
+    static ADC: StaticCell<Adc<'static, Async>> = StaticCell::new();
+    let adc = ADC.init(Adc::new(p.ADC, Irqs, adc::Config::default()));
+    // Set up the temperature sensor
+    static TEMP_SENSOR: StaticCell<adc::Channel<'static>> = StaticCell::new();
+    let temp_sensor = TEMP_SENSOR.init(adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR));
 
     // Create the driver, from the HAL.
     let driver = Driver::new(p.USB, Irqs);
@@ -97,7 +106,8 @@ async fn main(_spawner: Spawner) {
     let usb_fut = usb.run();
 
     // Channel
-    static CHANNEL: StaticCell<Channel<CriticalSectionRawMutex, u32, 1>> = StaticCell::new();
+    static CHANNEL: StaticCell<Channel<CriticalSectionRawMutex, Result<f32, adc::Error>, 1>> =
+        StaticCell::new();
     let channel = CHANNEL.init(Channel::new());
     let sender = channel.sender();
     let receiver = channel.receiver();
@@ -112,27 +122,23 @@ async fn main(_spawner: Spawner) {
             led.set_high();
 
             select(
-                select(
-                    async {
-                        inp.wait_for_high().await;
-                        log::info!("User!");
-                    },
-                    async {
-                        Timer::after_secs(2).await;
-                        log::info!("Timeout!");
-                    },
-                ),
+                async {
+                    inp.wait_for_high().await;
+                    log::info!("User!");
+                },
                 async {
                     let val = receiver.receive().await;
-                    log::info!("Received {}.", val);
+                    match val {
+                        Ok(val) => log::info!("Temperature: {:.2} C.", val),
+                        Err(e) => log::error!("Error receiving temperature: {:?}", e),
+                    }
                 },
             )
             .await;
-
+            Timer::after_secs(1).await;
             log::info!("Turn off LED");
             led.set_low();
-
-            Timer::after_secs(2).await;
+            Timer::after_secs(1).await;
         }
     };
 
@@ -147,13 +153,13 @@ async fn main(_spawner: Spawner) {
     };
 
     // Spawn core 1
-    static CORE1_STACK: StaticCell<Stack<8192>> = StaticCell::new();
+    static CORE1_STACK: StaticCell<Stack<512>> = StaticCell::new();
     static CORE1_EXECUTOR: StaticCell<Executor> = StaticCell::new();
     let stack = CORE1_STACK.init(Stack::new());
-    spawn_core1(p.CORE1, stack , move || {
+    spawn_core1(p.CORE1, stack, move || {
         let exec = CORE1_EXECUTOR.init(Executor::new());
         exec.run(|spawner| {
-            if let Err(e) = spawner.spawn(core1_ctr(sender)) {
+            if let Err(e) = spawner.spawn(core1_ctr(sender, adc, temp_sensor)) {
                 log::error!("Could not spawn core 1: {e:?}");
             }
         })
@@ -187,11 +193,19 @@ async fn echo<'d, T: Instance + 'd>(
 }
 
 #[embassy_executor::task]
-async fn core1_ctr(sender: Sender<'static, CriticalSectionRawMutex, u32, 1>) {
-    let mut ctr = 0;
+async fn core1_ctr(
+    sender: Sender<'static, CriticalSectionRawMutex, Result<f32, adc::Error>, 1>,
+    adc: &'static mut Adc<'static, Async>,
+    temp_sensor: &'static mut adc::Channel<'static>,
+) {
     loop {
-        sender.send(ctr).await;
-        ctr += 1;
-        Timer::after_secs(1).await;
+        // Read the temperature sensor
+        let temp = adc.read(temp_sensor).await;
+        sender
+            .send(temp.map(|temp| {
+                let volt = (temp as f32 / 4095.0) * 3.3;
+                27.0 - ((volt - 0.706) / 0.001721)
+            }))
+            .await;
     }
 }
