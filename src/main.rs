@@ -5,7 +5,7 @@
 #![no_std]
 #![no_main]
 
-use core::panic;
+use core::{panic, str::from_utf8};
 
 use defmt::*;
 use embassy_executor::{Executor, Spawner};
@@ -144,10 +144,19 @@ async fn main(_spawner: Spawner) {
 
     // Do stuff with the class!
     let echo_fut = async {
+        let mut data = [0; 64];
         loop {
             class.wait_connection().await;
             log::info!("Connected");
-            let _ = echo(&mut class).await;
+            while let Ok(n) = class.read_packet(&mut data).await { // read from tty0
+                if let Ok(s) = from_utf8(&data[..n]) {
+                    log::info!("Received: {}", s); // echo to log port, which is tty1
+                    let _ = class.write_packet(s.as_bytes()).await; // echo back to tty0
+                } else {
+                    log::error!("Received invalid UTF-8");
+                }
+            }
+            // let _ = echo(&mut class).await;
             log::info!("Disconnected");
         }
     };
@@ -180,17 +189,17 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-async fn echo<'d, T: Instance + 'd>(
-    class: &mut CdcAcmClass<'d, Driver<'d, T>>,
-) -> Result<(), Disconnected> {
-    let mut buf = [0; 64];
-    loop {
-        let n = class.read_packet(&mut buf).await?;
-        let data = &buf[..n];
-        info!("data: {:x}", data);
-        class.write_packet(data).await?;
-    }
-}
+// async fn echo<'d, T: Instance + 'd>(
+//     class: &mut CdcAcmClass<'d, Driver<'d, T>>,
+// ) -> Result<(), Disconnected> {
+//     let mut buf = [0; 64];
+//     loop {
+//         let n = class.read_packet(&mut buf).await?;
+//         let data = &buf[..n];
+//         info!("data: {:x}", data);
+//         class.write_packet(data).await?;
+//     }
+// }
 
 #[embassy_executor::task]
 async fn core1_ctr(
