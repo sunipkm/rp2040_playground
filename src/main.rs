@@ -8,12 +8,17 @@
 use core::panic;
 
 use defmt::*;
-use embassy_executor::Spawner;
+use embassy_executor::{Executor, Spawner};
 use embassy_futures::{join::join, select::select};
 use embassy_rp::{
     bind_interrupts, gpio,
+    multicore::{Stack, spawn_core1},
     peripherals::USB,
     usb::{Driver, Instance, InterruptHandler},
+};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex,
+    channel::{Channel, Sender},
 };
 use embassy_time::Timer;
 use embassy_usb::{
@@ -22,6 +27,7 @@ use embassy_usb::{
     driver::EndpointError,
 };
 use gpio::{Input, Level, Output, Pull};
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
@@ -90,15 +96,38 @@ async fn main(_spawner: Spawner) {
     // Run the USB device.
     let usb_fut = usb.run();
 
+    // Channel
+    static CHANNEL: StaticCell<Channel<CriticalSectionRawMutex, u32, 1>> = StaticCell::new();
+    let channel = CHANNEL.init(Channel::new());
+    let sender = channel.sender();
+    let receiver = channel.receiver();
+
+    // LED controller
     let led_fut = async {
         let mut led = Output::new(p.PIN_25, Level::Low);
-        let mut async_input = Input::new(p.PIN_16, Pull::Down);
+        let mut inp = Input::new(p.PIN_16, Pull::Down);
 
         loop {
             log::info!("Turn on LED");
             led.set_high();
 
-            select(wrap_wait_for_high(&mut async_input), wrap_after_secs(2)).await;
+            select(
+                select(
+                    async {
+                        inp.wait_for_high().await;
+                        log::info!("User!");
+                    },
+                    async {
+                        Timer::after_secs(2).await;
+                        log::info!("Timeout!");
+                    },
+                ),
+                async {
+                    let val = receiver.receive().await;
+                    log::info!("Received {}.", val);
+                },
+            )
+            .await;
 
             log::info!("Turn off LED");
             led.set_low();
@@ -117,17 +146,21 @@ async fn main(_spawner: Spawner) {
         }
     };
 
+    // Spawn core 1
+    static CORE1_STACK: StaticCell<Stack<8192>> = StaticCell::new();
+    static CORE1_EXECUTOR: StaticCell<Executor> = StaticCell::new();
+    let stack = CORE1_STACK.init(Stack::new());
+    spawn_core1(p.CORE1, stack , move || {
+        let exec = CORE1_EXECUTOR.init(Executor::new());
+        exec.run(|spawner| {
+            if let Err(e) = spawner.spawn(core1_ctr(sender)) {
+                log::error!("Could not spawn core 1: {e:?}");
+            }
+        })
+    });
+
+    // Spawn other tasks
     join(usb_fut, join(echo_fut, join(led_fut, log_fut))).await;
-}
-
-pub async fn wrap_wait_for_high(input: &mut Input<'_>) {
-    input.wait_for_high().await;
-    log::info!("done wait_for_high");
-}
-
-pub async fn wrap_after_secs(secs: u64) {
-    Timer::after_secs(secs).await;
-    log::info!("done after_secs");
 }
 
 struct Disconnected {}
@@ -150,5 +183,15 @@ async fn echo<'d, T: Instance + 'd>(
         let data = &buf[..n];
         info!("data: {:x}", data);
         class.write_packet(data).await?;
+    }
+}
+
+#[embassy_executor::task]
+async fn core1_ctr(sender: Sender<'static, CriticalSectionRawMutex, u32, 1>) {
+    let mut ctr = 0;
+    loop {
+        sender.send(ctr).await;
+        ctr += 1;
+        Timer::after_secs(1).await;
     }
 }
