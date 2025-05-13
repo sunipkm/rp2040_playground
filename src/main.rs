@@ -5,9 +5,10 @@
 #![no_std]
 #![no_main]
 
-use core::{panic, str::from_utf8};
+use core::{cell::RefCell, panic, str::from_utf8};
 
 use defmt::*;
+use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
 use embassy_executor::{Executor, Spawner};
 use embassy_futures::{join::join, select::select};
 use embassy_rp::{
@@ -15,10 +16,11 @@ use embassy_rp::{
     bind_interrupts, gpio,
     multicore::{Stack, spawn_core1},
     peripherals::USB,
+    spi,
     usb::{Driver, Instance, InterruptHandler},
 };
 use embassy_sync::{
-    blocking_mutex::raw::CriticalSectionRawMutex,
+    blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
     channel::{Channel, Sender},
 };
 use embassy_time::Timer;
@@ -27,6 +29,7 @@ use embassy_usb::{
     class::cdc_acm::{CdcAcmClass, State},
     driver::EndpointError,
 };
+use embedded_hal_1::spi::MODE_0;
 use gpio::{Input, Level, Output, Pull};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -42,7 +45,7 @@ async fn logger_task(driver: Driver<'static, USB>) {
 }
 
 /// This macro simplifies the [embassy_futures::join::join] function.
-/// 
+///
 /// Example usage:
 /// ```no_run
 /// let task1 = async { /* ... */ };
@@ -55,7 +58,7 @@ async fn logger_task(driver: Driver<'static, USB>) {
 /// embassy_join!((task1, task2)).await;
 /// // multiple join
 /// embassy_join!((task1, task2, (task3, task4))).await;
-/// 
+///
 macro_rules! embassy_join {
     (($task:expr)) => { $task };
     (($task1:expr, $task2:expr)) => {
@@ -177,7 +180,8 @@ async fn main(_spawner: Spawner) {
         loop {
             class.wait_connection().await;
             log::info!("Connected");
-            while let Ok(n) = class.read_packet(&mut data).await { // read from tty0
+            while let Ok(n) = class.read_packet(&mut data).await {
+                // read from tty0
                 if let Ok(s) = from_utf8(&data[..n]) {
                     log::info!("Received: {}", s); // echo to log port, which is tty1
                     let _ = class.write_packet(s.as_bytes()).await; // echo back to tty0
@@ -189,6 +193,27 @@ async fn main(_spawner: Spawner) {
             log::info!("Disconnected");
         }
     };
+
+    // MCP25625
+    let mut can_cfg = spi::Config::default();
+    can_cfg.frequency = 2_000_000;
+    can_cfg.phase = spi::Phase::CaptureOnFirstTransition; // CPHA=0
+    can_cfg.polarity = spi::Polarity::IdleLow; // CPOL=0
+    let spi: spi::Spi<'_, embassy_rp::peripherals::SPI0, spi::Blocking> = spi::Spi::new_blocking(p.SPI0, p.PIN_18, p.PIN_19, p.PIN_20, can_cfg.clone());
+    let spi_bus: embassy_sync::blocking_mutex::Mutex<NoopRawMutex, _> =
+        embassy_sync::blocking_mutex::Mutex::new(RefCell::new(spi));
+    let can_spi = SpiDeviceWithConfig::new(&spi_bus, Output::new(p.PIN_17, Level::High), can_cfg);
+    let mut can: mcp25xx::MCP25xx<SpiDeviceWithConfig<'_, NoopRawMutex, spi::Spi<'_, embassy_rp::peripherals::SPI0, spi::Blocking>, Output<'_>>> = mcp25xx::MCP25xx { spi: can_spi };
+    let can_cfg = mcp25xx::Config::default()
+        .mode(mcp25xx::registers::OperationMode::NormalOperation)
+        .bitrate(mcp25xx::bitrates::clock_16mhz::CNF_500K_BPS)
+        .receive_buffer_0(
+            mcp25xx::registers::RXB0CTRL::default().with_rxm(mcp25xx::registers::RXM::ReceiveAny),
+        );
+    if let Err(e) = can.apply_config(&can_cfg) {
+        log::error!("CAN: Could not apply config: {e:?}");
+    }
+
 
     // Spawn core 1
     static CORE1_STACK: StaticCell<Stack<512>> = StaticCell::new();
@@ -236,6 +261,7 @@ async fn core1_ctr(
     sender: Sender<'static, CriticalSectionRawMutex, Result<f32, adc::Error>, 1>,
     adc: &'static mut Adc<'static, Async>,
     temp_sensor: &'static mut adc::Channel<'static>,
+    // canbus: mcp25xx::MCP25xx<SpiDeviceWithConfig<'static, NoopRawMutex, spi::Spi<'static, embassy_rp::peripherals::SPI0, spi::Blocking>, Output<'static>>>,
 ) {
     loop {
         // Read the temperature sensor
