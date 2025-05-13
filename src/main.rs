@@ -41,6 +41,31 @@ async fn logger_task(driver: Driver<'static, USB>) {
     embassy_usb_logger::run!(1024, log::LevelFilter::Debug, driver);
 }
 
+/// This macro simplifies the [embassy_futures::join::join] function.
+/// 
+/// Example usage:
+/// ```no_run
+/// let task1 = async { /* ... */ };
+/// let task2 = async { /* ... */ };
+/// let task3 = async { /* ... */ };
+/// let task4 = async { /* ... */ };
+/// // single join
+/// embassy_join!((task1)).await;
+/// // double join
+/// embassy_join!((task1, task2)).await;
+/// // multiple join
+/// embassy_join!((task1, task2, (task3, task4))).await;
+/// 
+macro_rules! embassy_join {
+    (($task:expr)) => { $task };
+    (($task1:expr, $task2:expr)) => {
+        embassy_futures::join::join($task1, $task2)
+    };
+    (($task1:expr, $task2:expr, $($rest:tt),+)) => {
+        embassy_futures::join::join($task1, embassy_futures::join::join($task2, embassy_join!($($rest)*)))
+    };
+}
+
 /// It requires an external signal to be manually triggered on PIN 16. For
 /// example, this could be accomplished using an external power source with a
 /// button so that it is possible to toggle the signal from low to high.
@@ -52,14 +77,14 @@ async fn logger_task(driver: Driver<'static, USB>) {
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-
+    info!("Initialized peripherals");
     // Set up the ADC
     static ADC: StaticCell<Adc<'static, Async>> = StaticCell::new();
     let adc = ADC.init(Adc::new(p.ADC, Irqs, adc::Config::default()));
     // Set up the temperature sensor
     static TEMP_SENSOR: StaticCell<adc::Channel<'static>> = StaticCell::new();
     let temp_sensor = TEMP_SENSOR.init(adc::Channel::new_temp_sensor(p.ADC_TEMP_SENSOR));
-
+    info!("Initialized ADC with temperature sensor");
     // Create the driver, from the HAL.
     let driver = Driver::new(p.USB, Irqs);
 
@@ -91,9 +116,11 @@ async fn main(_spawner: Spawner) {
 
     // Create classes on the builder.
     let mut class = CdcAcmClass::new(&mut builder, &mut state, 64);
+    info!("Created CDC ACM class");
 
     // Create a class for the logger
     let logger_class = CdcAcmClass::new(&mut builder, &mut logger_state, 64);
+    info!("Created logger class");
 
     // Creates the logger and returns the logger future
     // Note: You'll need to use log::info! afterwards instead of info! for this to work (this also applies to all the other log::* macros)
@@ -101,9 +128,11 @@ async fn main(_spawner: Spawner) {
 
     // Build the builder.
     let mut usb = builder.build();
+    info!("Built USB device");
 
     // Run the USB device.
     let usb_fut = usb.run();
+    info!("Running USB device");
 
     // Channel
     static CHANNEL: StaticCell<Channel<CriticalSectionRawMutex, Result<f32, adc::Error>, 1>> =
@@ -175,7 +204,8 @@ async fn main(_spawner: Spawner) {
     });
 
     // Spawn other tasks
-    join(usb_fut, join(echo_fut, join(led_fut, log_fut))).await;
+    // join(usb_fut, join(echo_fut, join(led_fut, log_fut))).await;
+    embassy_join!((usb_fut, echo_fut, (led_fut, log_fut))).await;
 }
 
 struct Disconnected {}
