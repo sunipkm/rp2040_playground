@@ -10,7 +10,6 @@ use core::{cell::RefCell, panic, str::from_utf8};
 use defmt::*;
 use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
 use embassy_executor::{Executor, Spawner};
-use embassy_futures::select::select;
 use embassy_rp::{
     adc::{self, Adc, Async},
     bind_interrupts, gpio,
@@ -25,8 +24,8 @@ use embassy_sync::{
 };
 use embassy_time::Timer;
 use embassy_usb::{
-    Builder, Config,
-    class::cdc_acm::{CdcAcmClass, State},
+    Builder as UsbBuilder, Config as UsbConfig,
+    class::cdc_acm::{CdcAcmClass, State as CdcAcmState},
     driver::EndpointError,
 };
 use gpio::{Input, Level, Output, Pull};
@@ -68,6 +67,31 @@ macro_rules! embassy_join {
     };
 }
 
+/// This macro simplifies the [embassy_futures::select::select] function.
+/// 
+/// Example usage:
+/// ```no_run
+/// let task1 = async { /* ... */ };
+/// let task2 = async { /* ... */ };
+/// let task3 = async { /* ... */ };
+/// let task4 = async { /* ... */ };
+/// // single select
+/// embassy_select!((task1)).await;
+/// // double select
+/// embassy_select!((task1, task2)).await;
+/// // multiple select
+/// embassy_select!((task1, task2, (task3, task4))).await;
+///
+macro_rules! embassy_select {
+    (($task:expr)) => { $task };
+    (($task1:expr, $task2:expr)) => {
+        embassy_futures::select::select($task1, $task2)
+    };
+    (($task1:expr, $task2:expr, $($rest:tt),+)) => {
+        embassy_futures::select::select($task1, embassy_futures::select::select($task2, embassy_select!($($rest)*)))
+    };
+}
+
 /// It requires an external signal to be manually triggered on PIN 16. For
 /// example, this could be accomplished using an external power source with a
 /// button so that it is possible to toggle the signal from low to high.
@@ -91,7 +115,7 @@ async fn main(_spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
 
     // Create embassy-usb Config
-    let mut config = Config::new(0xc0de, 0xcafe);
+    let mut config = UsbConfig::new(0xc0de, 0xcafe);
     config.manufacturer = Some("Embassy");
     config.product = Some("USB-serial example");
     config.serial_number = Some("12345678");
@@ -104,10 +128,10 @@ async fn main(_spawner: Spawner) {
     let mut bos_descriptor = [0; 256];
     let mut control_buf = [0; 64];
 
-    let mut state = State::new();
-    let mut logger_state = State::new();
+    let mut state = CdcAcmState::new();
+    let mut logger_state = CdcAcmState::new();
 
-    let mut builder = Builder::new(
+    let mut builder = UsbBuilder::new(
         driver,
         config,
         &mut config_descriptor,
@@ -152,7 +176,7 @@ async fn main(_spawner: Spawner) {
             log::info!("Turn on LED");
             led.set_high();
 
-            select(
+            embassy_select!((
                 async {
                     inp.wait_for_high().await;
                     log::info!("User!");
@@ -163,8 +187,8 @@ async fn main(_spawner: Spawner) {
                         Ok(val) => log::info!("Temperature: {:.2} C.", val),
                         Err(e) => log::error!("Error receiving temperature: {:?}", e),
                     }
-                },
-            )
+                }
+            ))
             .await;
             Timer::after_secs(1).await;
             log::info!("Turn off LED");
@@ -220,6 +244,16 @@ async fn main(_spawner: Spawner) {
     if let Err(e) = can.apply_config(&can_cfg) {
         log::error!("CAN: Could not apply config: {e:?}");
     }
+    can.read_status()
+        .map(|status| log::info!("CAN: Status: {status:?}"))
+        .unwrap_or_else(|e| log::error!("CAN: Could not read status: {e:?}"));
+    can.read_register::<mcp25xx::registers::CANINTF>()
+        .map(|status| {
+            log::info!("CAN: Interrupt flags: {status:?}");
+        })
+        .unwrap_or_else(|e| {
+            log::error!("CAN: Could not read interrupt flags: {e:?}");
+        });
 
     // Spawn core 1
     static CORE1_STACK: StaticCell<Stack<512>> = StaticCell::new();
