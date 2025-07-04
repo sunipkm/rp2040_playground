@@ -3,7 +3,8 @@
     "rust-analyzer": {
       "initialization_options": {
         "cargo": {
-          "target": "thumbv6m-none-eabi"
+          // "target": "thumbv6m-none-eabi"
+          "target": "thumbv8m.main-none-eabihf"
         },
         "check": {
           "all-targets": false

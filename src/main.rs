@@ -68,7 +68,7 @@ macro_rules! embassy_join {
 }
 
 /// This macro simplifies the [embassy_futures::select::select] function.
-/// 
+///
 /// Example usage:
 /// ```no_run
 /// let task1 = async { /* ... */ };

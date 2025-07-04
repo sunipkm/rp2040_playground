@@ -1,8 +1,10 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
-runner = "probe-rs run --chip RP2040 --protocol swd" # "elf2uf2-rs -d"
+# runner = "probe-rs run --chip RP2040 --protocol swd" # "elf2uf2-rs -d"
+runner = "probe-rs run --chip RP235x --protocol swd" # "elf2uf2-rs -d"
 
 [build]
-target = "thumbv6m-none-eabi" # Cortex-M0 and Cortex-M0+
+# target = "thumbv6m-none-eabi" # Cortex-M0 and Cortex-M0+
+target = "thumbv8m.main-none-eabihf" # RP2350x
 
 [target.thumbv6m-none-eabi]
 rustflags = [
@@ -12,6 +14,16 @@ rustflags = [
     "link-arg=-Tlink.x",
     "-C",
     "link-arg=-Tlink-rp.x",
+    "-C",
+    "link-arg=-Tdefmt.x",
+]
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = [
+    "-C",
+    "link-arg=--nmagic",
+    "-C",
+    "link-arg=-Tlink.x",
     "-C",
     "link-arg=-Tdefmt.x",
 ]
