@@ -169,7 +169,7 @@ async fn main(_spawner: Spawner) {
 
     // LED controller
     let led_fut = async {
-        let mut led = Output::new(p.PIN_25, Level::Low);
+        let mut led = Output::new(p.PIN_27, Level::Low);
         let mut inp = Input::new(p.PIN_16, Pull::Down);
 
         loop {
